@@ -1,0 +1,197 @@
+// Question 1
+db.listingsAndReviews.aggregate([
+    // Filter valid records
+    // Group and calculate average cleanliness
+    // Apply threshold, sort, and format output
+    { $match: { property_type: { $type: "string", $ne: "" }, "review_scores.review_scores_cleanliness": { $type: "number" } } },
+    { $group: { _id: "$property_type", averageCleanlinessScore: { $avg: "$review_scores.review_scores_cleanliness" } } },
+    { $match: { averageCleanlinessScore: { $gt: 9.5 } } },
+    { $sort: { averageCleanlinessScore: -1, _id: 1 } },
+    { $project: { _id: 0, property_type: "$_id", averageCleanlinessScore: { $round: ["$averageCleanlinessScore", 2] } } }
+])
+
+
+// Question 2 myScore aggregation
+db.listingsAndReviews.aggregate([
+    // Filter documents needed for scoring
+    { $match: {
+        name: { $type: "string", $ne: "" },
+        room_type: { $type: "string", $ne: "" },
+        amenities: { $exists: true, $ne: [] },
+        price: { $exists: true, $ne: null },
+        "address.market": { $type: "string", $ne: "" },
+        "address.country": { $type: "string", $ne: "" },
+        "review_scores.review_scores_rating": { $type: "number" },
+        "review_scores.review_scores_cleanliness": { $type: "number" },
+        "review_scores.review_scores_location": { $type: "number" },
+        "review_scores.review_scores_value": { $type: "number" },
+        number_of_reviews: { $exists: true },
+        "host.host_response_rate": { $exists: true },
+        "host.host_is_superhost": { $exists: true },
+        "host.host_identity_verified": { $exists: true }
+    } },
+
+    // Convert raw values into numeric working fields
+    { $addFields: {
+        priceValue: { $convert: { input: "$price", to: "double", onError: 0, onNull: 0 } },
+        cleaningFeeValue: { $convert: { input: "$cleaning_fee", to: "double", onError: 0, onNull: 0 } },
+        extraPeopleValue: { $convert: { input: "$extra_people", to: "double", onError: 0, onNull: 0 } },
+        guestsIncludedValue: { $convert: { input: "$guests_included", to: "double", onError: 0, onNull: 0 } },
+        responseRateValue: { $convert: { input: "$host.host_response_rate", to: "double", onError: 0, onNull: 0 } },
+        bathroomsValue: { $convert: { input: "$bathrooms", to: "double", onError: 0, onNull: 0 } }
+    } },
+
+    // Engineer normalized feature scores
+    { $addFields: {
+	//Review Quality (RQ)
+        ratingScore: { $divide: ["$review_scores.review_scores_rating", 100] },
+        cleanlinessScore: { $divide: ["$review_scores.review_scores_cleanliness", 10] },
+        locationScore: { $divide: ["$review_scores.review_scores_location", 10] },
+        valueScore: { $divide: ["$review_scores.review_scores_value", 10] },
+
+	//Affordability (AF)
+        priceScore: { $let: {
+            vars: { cappedPrice: { $min: ["$priceValue", 300] } },
+            in: { $divide: [{ $subtract: [300, "$$cappedPrice"] }, 300] } 
+	} },
+
+        cleaningFeeScore: { $let: {
+            vars: { cappedFee: { $min: ["$cleaningFeeValue", 150] } },
+            in: { $divide: [{ $subtract: [150, "$$cappedFee"] }, 150] } 
+	} },
+
+        extraPeopleScore: { $let: {
+            vars: { cappedExtra: { $min: ["$extraPeopleValue", 50] } },
+            in: { $divide: [{ $subtract: [50, "$$cappedExtra"] }, 50] } 
+	} },
+
+        guestsIncludedScore: { $min: [1, { $divide: ["$guestsIncludedValue", 4] } ] },
+
+	//Comfort & Amenities (CA) 
+        roomTypeScore: { $switch: { branches: [
+                { case: { $eq: ["$room_type", "Entire home/apt"] }, then: 1 },
+                { case: { $eq: ["$room_type", "Hotel room"] }, then: 0.7 },
+                { case: { $eq: ["$room_type", "Private room"] }, then: 0.4 },
+                { case: { $eq: ["$room_type", "Shared room"] }, then: 0.1 }
+            ],
+            default: 0.3
+        } },
+
+        amenityScore: { $divide: [ { $size: { $setIntersection: [ "$amenities", ["Wifi", "Kitchen", "Air conditioning", "Washer", "Free parking on premises"] ] } }, 5 ] },
+
+        spaceScore: { $avg: [
+            { $min: [1, { $divide: [{ $ifNull: ["$accommodates", 0] }, 6] }] },
+            { $min: [1, { $divide: [{ $ifNull: ["$bedrooms", 0] }, 3] }] },
+            { $min: [1, { $divide: ["$bathroomsValue", 2] }] }
+        ] },
+
+	//Confidence (CF)
+        reviewCountScore: { $min: [ 1, { $divide: [ { $ln: { $add: [{ $ifNull: ["$number_of_reviews", 0] }, 1] } },
+                			{ $ln: 201 } ] } ] },
+
+        responseRateScore: { $divide: ["$responseRateValue", 100] },
+        superhostScore: { $cond: [{ $eq: ["$host.host_is_superhost", true] }, 1, 0] },
+        identityVerifiedScore: { $cond: [{ $eq: ["$host.host_identity_verified", true] }, 1, 0] }
+    } },
+
+    // Combine features into main criteria and compute the mean values of each. 
+    { $addFields: {
+        confidenceScore: { $avg: ["$reviewCountScore", "$responseRateScore", "$superhostScore", "$identityVerifiedScore"] },
+        reviewQualityScore: { $avg: ["$ratingScore", "$cleanlinessScore", "$locationScore", "$valueScore"] },
+        comfortAmenitiesScore: { $avg: ["$roomTypeScore", "$amenityScore", "$spaceScore"] },
+        affordabilityScore: { $avg: ["$priceScore", "$cleaningFeeScore", "$extraPeopleScore", "$guestsIncludedScore"] }
+    } },
+
+    // Compute myScore, applying AHP ranks through multiplication, and keep the top 5
+    { $addFields: {
+        myScore: { $round: [ { $multiply: [100, { $add: [
+                { $multiply: [0.565, "$confidenceScore"] },
+                { $multiply: [0.262, "$reviewQualityScore"] },
+                { $multiply: [0.118, "$comfortAmenitiesScore"] },
+                { $multiply: [0.055, "$affordabilityScore"] } ] }] }, 2 ] }
+    } },
+    { $sort: { myScore: -1, confidenceScore: -1, reviewQualityScore: -1, priceValue: 1, _id: 1 } },
+    { $limit: 5 },
+
+    // Format final output
+    { $project: {
+        _id: 0,
+        name: 1,
+        destination: { $concat: ["$address.market", ", ", "$address.country"] },
+        keyCharacteristics: {
+            property_type: "$property_type",
+            room_type: "$room_type",
+            price: { $round: ["$priceValue", 2] },
+            rating: "$review_scores.review_scores_rating",
+            cleanliness: "$review_scores.review_scores_cleanliness",
+            location: "$review_scores.review_scores_location",
+            value: "$review_scores.review_scores_value",
+            number_of_reviews: "$number_of_reviews",
+            host_response_rate: "$responseRateValue",
+            host_is_superhost: "$host.host_is_superhost",
+            host_identity_verified: "$host.host_identity_verified",
+            matchedAmenities: { $setIntersection: [ "$amenities", ["Wifi", "Kitchen", "Air conditioning", "Washer", "Free parking on premises"] ] } },
+        myScore: 1
+    } }
+])
+
+
+// Question 3 - Pipeline 1: Review Extraction and Migration Pipeline
+db.listingsAndReviews.aggregate([
+    //Break the array and Extract embedded reviews into the new reviews collection
+    { $unwind: "$reviews" },
+    { $project: {
+        _id: "$reviews._id",
+        listing_id: "$reviews.listing_id",
+        date: "$reviews.date",
+        reviewer_id: "$reviews.reviewer_id",
+        reviewer_name: "$reviews.reviewer_name",
+        comments: "$reviews.comments"
+    } },
+    { $merge: {
+        into: "reviews",
+        on: "_id",
+        whenMatched: "replace",
+        whenNotMatched: "insert"
+    } }
+])
+
+
+// Question 3 - Pipeline 2: Parent Listing Restructuring Pipeline
+db.listingsAndReviews.aggregate([
+    // Add schema version and keep only a small recent review subset
+    { $addFields: {
+        schema_version: 2,
+        recentReviews: { $slice: ["$reviews", 3] }
+    } },
+    { $unset: "reviews" },
+    { $merge: {
+        into: "listingsAndReviews",
+        on: "_id",
+        whenMatched: "replace",
+        whenNotMatched: "insert"
+    } }
+])
+
+
+// Question 3 - Pipeline 3: Listing-Review Relationship Validation Pipeline
+db.listingsAndReviews.aggregate([
+    { $match: { _id: "10006546" } },
+    { $lookup: {
+        from: "reviews",
+        localField: "_id",
+        foreignField: "listing_id",
+        as: "reconstructedReviews"
+    } },
+    { $project: {
+        name: 1,
+        recentReviews: { $slice: ["$recentReviews", 3] },
+        reconstructedReviews: { $slice: ["$reconstructedReviews", 3] }
+    } }
+])
+
+
+
+
+// Question 3 - Index: Review Retrieval Support Index
+db.reviews.createIndex({ listing_id: 1, date: -1 })
